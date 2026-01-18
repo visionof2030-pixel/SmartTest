@@ -1,12 +1,12 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
 import os
 import itertools
+import io
 import pdfplumber
 from PIL import Image
-import io
 import base64
 
 app = FastAPI()
@@ -18,6 +18,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class AskRequest(BaseModel):
+    prompt: str
+    model: str = "gemini-2.5-flash-lite"
+    language: str = "ar"
 
 keys = [
     os.getenv("GEMINI_KEY_1"),
@@ -34,14 +39,16 @@ if not keys:
     raise RuntimeError("No Gemini API keys found")
 
 key_cycle = itertools.cycle(keys)
-MODEL = "gemini-2.5-flash-lite"
+
+def output_language(lang: str):
+    if lang == "en":
+        return "Write the final output in clear academic English."
+    return "اكتب الناتج النهائي باللغة العربية الفصحى الواضحة."
 
 def get_model():
-    genai.configure(api_key=next(key_cycle))
-    return genai.GenerativeModel(MODEL)
-
-class AskRequest(BaseModel):
-    prompt: str
+    api_key = next(key_cycle)
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel("gemini-2.5-flash-lite")
 
 @app.get("/")
 def root():
@@ -51,137 +58,126 @@ def root():
 def ask(req: AskRequest):
     try:
         model = get_model()
-        response = model.generate_content(req.prompt)
+        lang_instruction = output_language(req.language)
+        prompt = f"{lang_instruction}\n\n{req.prompt}"
+        response = model.generate_content(prompt)
         return {"result": response.text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def extract_text_from_pdf(file_bytes: bytes):
+    text = ""
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text
+
+def extract_text_from_image(file_bytes: bytes):
+    image = Image.open(io.BytesIO(file_bytes))
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    return buffered.getvalue()
+
 @app.post("/ask-file")
-async def ask_file(file: UploadFile = File(...)):
+async def ask_file(
+    file: UploadFile = File(...),
+    mode: str = Form("questions"),
+    language: str = Form("ar"),
+    num_questions: int = Form(10)
+):
     try:
-        content = await file.read()
+        file_bytes = await file.read()
+        filename = file.filename.lower()
 
-        if file.content_type == "application/pdf":
-            with pdfplumber.open(io.BytesIO(content)) as pdf:
-                text = "\n".join(
-                    [p.extract_text() for p in pdf.pages if p.extract_text()]
-                )
-
-            if not text.strip():
-                raise HTTPException(status_code=400, detail="PDF has no readable text")
-
-            prompt = f"""
-            أنشئ أسئلة اختيار من متعدد من النص التالي.
-            كل سؤال يحتوي:
-            - سؤال واضح
-            - 4 خيارات
-            - الإجابة الصحيحة
-            - شرح موسع للإجابة الصحيحة
-            - شرح مختصر لماذا الخيارات الأخرى خاطئة
-
-            أعد النتيجة بصيغة JSON فقط:
-            {{
-              "questions":[
-                {{
-                  "q":"",
-                  "options":["","","",""],
-                  "answer":0,
-                  "explanation":""
-                }}
-              ]
-            }}
-
-            النص:
-            {text[:12000]}
-            """
-
-            model = get_model()
-            response = model.generate_content(prompt)
-            return {"result": response.text}
-
-        elif file.content_type.startswith("image/"):
-            img = Image.open(io.BytesIO(content))
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            img_b64 = base64.b64encode(buf.getvalue()).decode()
-
-            model = get_model()
-            response = model.generate_content([
-                {"mime_type": "image/png", "data": img_b64},
-                """
-                استخرج أسئلة تعليمية من الصورة:
-                - اختيار من متعدد
-                - شرح موسع للإجابة الصحيحة
-                - شرح مختصر للخيارات الخاطئة
-                بنفس صيغة JSON
-                """
-            ])
-
-            return {"result": response.text}
-
+        if filename.endswith(".pdf"):
+            text = extract_text_from_pdf(file_bytes)
+        elif filename.endswith((".png", ".jpg", ".jpeg")):
+            image_bytes = extract_text_from_image(file_bytes)
+            text = None
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type")
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/summarize-file")
-async def summarize_file(file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        text = ""
-
-        if file.content_type == "application/pdf":
-            with pdfplumber.open(io.BytesIO(content)) as pdf:
-                text = "\n".join(
-                    [p.extract_text() for p in pdf.pages if p.extract_text()]
-                )
-
-        elif file.content_type.startswith("image/"):
-            img = Image.open(io.BytesIO(content))
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            img_b64 = base64.b64encode(buf.getvalue()).decode()
-
-            model = get_model()
-            response = model.generate_content([
-                {"mime_type": "image/png", "data": img_b64},
-                """
-                لخص محتوى الصورة تلخيصاً تعليمياً احترافياً:
-                - ملخص عام
-                - أفكار رئيسية
-                - نقاط مهمة
-                - خلاصة
-                بدون تكرار
-                """
-            ])
-            return {"summary": response.text}
-
-        if not text.strip():
-            raise HTTPException(status_code=400, detail="No text found")
-
         model = get_model()
-        prompt = f"""
-        أنت خبير تلخيص احترافي.
+        lang_instruction = output_language(language)
 
-        لخص النص التالي بدون تكرار الأفكار:
-        - دمج المتشابه
-        - حذف الحشو
-        - تنظيم منطقي
-        - صياغة تعليمية واضحة
+        if mode == "summary":
+            prompt = f"""
+You are a professional summarization expert.
 
-        الناتج:
-        1. ملخص عام
-        2. أفكار رئيسية
-        3. نقاط تعليمية
-        4. خلاصة نهائية
+Read the content regardless of its original language.
 
-        النص:
-        {text[:12000]}
-        """
+{lang_instruction}
 
-        response = model.generate_content(prompt)
-        return {"summary": response.text}
+Summarize with:
+- No repetition
+- Merge similar ideas
+- Clear structure
+
+Output:
+1. General summary
+2. Main ideas
+3. Important points
+4. Final conclusion
+
+CONTENT:
+{text[:12000] if text else ""}
+"""
+            if text:
+                response = model.generate_content(prompt)
+            else:
+                response = model.generate_content([
+                    prompt,
+                    {
+                        "mime_type": file.content_type,
+                        "data": image_bytes
+                    }
+                ])
+            return {"result": response.text}
+
+        else:
+            prompt = f"""
+You are an expert educational content generator.
+
+Read the content carefully regardless of its language.
+
+{lang_instruction}
+
+Create {num_questions} multiple choice questions.
+
+Rules:
+- 4 options
+- Correct answer index
+- Long explanation for correct answer
+- Short explanation for wrong options
+
+Return JSON ONLY:
+{{
+  "questions":[
+    {{
+      "q":"",
+      "options":["","","",""],
+      "answer":0,
+      "explanation":""
+    }}
+  ]
+}}
+
+CONTENT:
+{text[:12000] if text else ""}
+"""
+            if text:
+                response = model.generate_content(prompt)
+            else:
+                response = model.generate_content([
+                    prompt,
+                    {
+                        "mime_type": file.content_type,
+                        "data": image_bytes
+                    }
+                ])
+            return {"result": response.text}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
