@@ -1,26 +1,23 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
 import os
 import itertools
-import base64
-import tempfile
 import pdfplumber
+from PIL import Image
+import io
+import base64
 
 app = FastAPI()
 
-# ================== Models ==================
-
-class AskRequest(BaseModel):
-    prompt: str
-    model: str = "gemini-2.5-flash-lite"
-
-class FileAnalyzeRequest(BaseModel):
-    file: str
-    fileType: str
-    mimeType: str
-
-# ================== API KEYS ==================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 keys = [
     os.getenv("GEMINI_KEY_1"),
@@ -37,120 +34,154 @@ if not keys:
     raise RuntimeError("No Gemini API keys found")
 
 key_cycle = itertools.cycle(keys)
+MODEL = "gemini-2.5-flash-lite"
 
-def ask_gemini(prompt: str, model_name: str = "gemini-2.5-flash-lite"):
-    last_error = None
-    for _ in range(len(keys)):
-        try:
-            api_key = next(key_cycle)
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
-            r = model.generate_content(prompt)
-            return r.text
-        except Exception as e:
-            last_error = str(e)
-    raise HTTPException(status_code=500, detail=f"All keys failed: {last_error}")
+def get_model():
+    genai.configure(api_key=next(key_cycle))
+    return genai.GenerativeModel(MODEL)
 
-# ================== Utils ==================
-
-def extract_text_from_pdf(b64: str) -> str:
-    pdf_bytes = base64.b64decode(b64)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
-        f.write(pdf_bytes)
-        path = f.name
-
-    text = ""
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                text += t + "\n"
-    return text.strip()
-
-# ================== Endpoints ==================
+class AskRequest(BaseModel):
+    prompt: str
 
 @app.get("/")
 def root():
     return {"status": "ok"}
 
-# --------- Manual Prompt ---------
 @app.post("/ask")
 def ask(req: AskRequest):
-    result = ask_gemini(req.prompt, req.model)
-    return {"result": result}
+    try:
+        model = get_model()
+        response = model.generate_content(req.prompt)
+        return {"result": response.text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# --------- Analyze PDF (Questions) ---------
-@app.post("/analyze-file")
-def analyze_file(req: FileAnalyzeRequest):
-    if req.fileType != "pdf":
-        raise HTTPException(status_code=400, detail="Only PDF supported")
+@app.post("/ask-file")
+async def ask_file(file: UploadFile = File(...)):
+    try:
+        content = await file.read()
 
-    text = extract_text_from_pdf(req.file)
+        if file.content_type == "application/pdf":
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                text = "\n".join(
+                    [p.extract_text() for p in pdf.pages if p.extract_text()]
+                )
 
-    prompt = f"""
-أنت خبير تقويم تعليمي.
-اقرأ النص التالي ثم أنشئ أسئلة تقيس الفهم العميق وليس الحفظ.
+            if not text.strip():
+                raise HTTPException(status_code=400, detail="PDF has no readable text")
 
-قواعد صارمة:
-- لا تكرر نفس الفكرة بصياغة مختلفة
-- كل سؤال يقيس فكرة مختلفة
-- التغذية الراجعة للإجابة الصحيحة تكون موسعة ومفصلة
-- التغذية الراجعة للإجابات الخاطئة مختصرة وتوضيحية
-- الأسئلة تعليمية وليست مباشرة
+            prompt = f"""
+            أنشئ أسئلة اختيار من متعدد من النص التالي.
+            كل سؤال يحتوي:
+            - سؤال واضح
+            - 4 خيارات
+            - الإجابة الصحيحة
+            - شرح موسع للإجابة الصحيحة
+            - شرح مختصر لماذا الخيارات الأخرى خاطئة
 
-أعد النتيجة JSON فقط بهذا الشكل:
-{{
-  "questions": [
-    {{
-      "q": "السؤال",
-      "options": ["أ", "ب", "ج", "د"],
-      "answer": 0,
-      "explanation_correct": "شرح موسع للإجابة الصحيحة",
-      "explanation_wrong": "سبب خطأ الخيارات الأخرى"
-    }}
-  ]
-}}
+            أعد النتيجة بصيغة JSON فقط:
+            {{
+              "questions":[
+                {{
+                  "q":"",
+                  "options":["","","",""],
+                  "answer":0,
+                  "explanation":""
+                }}
+              ]
+            }}
 
-النص:
-{text}
-"""
+            النص:
+            {text[:12000]}
+            """
 
-    result = ask_gemini(prompt)
-    return {"result": result}
+            model = get_model()
+            response = model.generate_content(prompt)
+            return {"result": response.text}
 
-# --------- Summarize PDF (Smart Summary) ---------
+        elif file.content_type.startswith("image/"):
+            img = Image.open(io.BytesIO(content))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+            model = get_model()
+            response = model.generate_content([
+                {"mime_type": "image/png", "data": img_b64},
+                """
+                استخرج أسئلة تعليمية من الصورة:
+                - اختيار من متعدد
+                - شرح موسع للإجابة الصحيحة
+                - شرح مختصر للخيارات الخاطئة
+                بنفس صيغة JSON
+                """
+            ])
+
+            return {"result": response.text}
+
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/summarize-file")
-def summarize_file(req: FileAnalyzeRequest):
-    if req.fileType != "pdf":
-        raise HTTPException(status_code=400, detail="Only PDF supported")
+async def summarize_file(file: UploadFile = File(...)):
+    try:
+        content = await file.read()
+        text = ""
 
-    text = extract_text_from_pdf(req.file)
+        if file.content_type == "application/pdf":
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                text = "\n".join(
+                    [p.extract_text() for p in pdf.pages if p.extract_text()]
+                )
 
-    prompt = f"""
-أنت خبير في التلخيص الأكاديمي الذكي.
+        elif file.content_type.startswith("image/"):
+            img = Image.open(io.BytesIO(content))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            img_b64 = base64.b64encode(buf.getvalue()).decode()
 
-مهمتك:
-تلخيص النص التالي دون تكرار الأفكار مع دمج المتشابه منها.
-لا تختصر بجمل قصيرة، بل قدم تلخيصاً تعليمياً منظمًا.
+            model = get_model()
+            response = model.generate_content([
+                {"mime_type": "image/png", "data": img_b64},
+                """
+                لخص محتوى الصورة تلخيصاً تعليمياً احترافياً:
+                - ملخص عام
+                - أفكار رئيسية
+                - نقاط مهمة
+                - خلاصة
+                بدون تكرار
+                """
+            ])
+            return {"summary": response.text}
 
-قواعد صارمة:
-- لا تكرر نفس المعنى بصياغات مختلفة
-- اجمع الأفكار المتشابهة في فكرة واحدة
-- استخدم عناوين واضحة
-- اجعل التلخيص تدريجياً من العام إلى الخاص
-- لا تفقد أي فكرة جوهرية
-- لا تضف معلومات غير موجودة
-- استخدم أسلوب تعليمي موجه للطلاب
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="No text found")
 
-التنسيق المطلوب:
-- عنوان رئيسي
-- عناوين فرعية
-- نقاط مركزة
-- فقرات قصيرة واضحة
+        model = get_model()
+        prompt = f"""
+        أنت خبير تلخيص احترافي.
 
-النص:
-{text}
-"""
+        لخص النص التالي بدون تكرار الأفكار:
+        - دمج المتشابه
+        - حذف الحشو
+        - تنظيم منطقي
+        - صياغة تعليمية واضحة
 
-    result = ask_gemini(prompt)
-    return {"result": result}
+        الناتج:
+        1. ملخص عام
+        2. أفكار رئيسية
+        3. نقاط تعليمية
+        4. خلاصة نهائية
+
+        النص:
+        {text[:12000]}
+        """
+
+        response = model.generate_content(prompt)
+        return {"summary": response.text}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
