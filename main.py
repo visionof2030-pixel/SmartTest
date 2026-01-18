@@ -4,8 +4,9 @@ from pydantic import BaseModel
 import google.generativeai as genai
 import os
 import itertools
-import base64
+import tempfile
 import fitz
+import base64
 
 app = FastAPI()
 
@@ -18,13 +19,6 @@ app.add_middleware(
 )
 
 class AskRequest(BaseModel):
-    model: str
-    prompt: str
-
-class AnalyzeRequest(BaseModel):
-    file: str
-    fileType: str
-    mimeType: str
     prompt: str
 
 keys = [
@@ -39,11 +33,15 @@ keys = [
 
 keys = [k for k in keys if k]
 if not keys:
-    raise RuntimeError("No Gemini API keys found in environment variables")
+    raise RuntimeError("No Gemini API keys found")
 
 key_cycle = itertools.cycle(keys)
 
 MODEL_NAME = "gemini-2.5-flash-lite"
+
+def get_model():
+    genai.configure(api_key=next(key_cycle))
+    return genai.GenerativeModel(MODEL_NAME)
 
 @app.get("/")
 def root():
@@ -51,109 +49,56 @@ def root():
 
 @app.post("/ask")
 def ask(req: AskRequest):
-    last_error = None
-    for _ in range(len(keys)):
-        try:
-            api_key = next(key_cycle)
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(MODEL_NAME)
-            response = model.generate_content(req.prompt)
-            return response.text
-        except Exception as e:
-            last_error = str(e)
-    raise HTTPException(status_code=500, detail=last_error)
+    try:
+        model = get_model()
+        response = model.generate_content(req.prompt)
+        return {"result": response.text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+def extract_text_from_pdf(path: str) -> str:
+    doc = fitz.open(path)
     text = ""
     for page in doc:
         text += page.get_text()
     return text
 
-@app.post("/analyze-file")
-def analyze_file(req: AnalyzeRequest):
+@app.post("/ask-file")
+async def ask_file(file: UploadFile = File(...)):
     try:
-        pdf_bytes = base64.b64decode(req.file)
-        text = extract_text_from_pdf(pdf_bytes)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid PDF file")
+        suffix = os.path.splitext(file.filename)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
 
-    last_error = None
+        if suffix.lower() == ".pdf":
+            content = extract_text_from_pdf(tmp_path)
+        else:
+            data = base64.b64encode(open(tmp_path, "rb").read()).decode()
+            content = f"IMAGE_BASE64:{data}"
 
-    for _ in range(len(keys)):
-        try:
-            api_key = next(key_cycle)
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(MODEL_NAME)
+        prompt = f"""
+حول المحتوى التالي إلى أسئلة اختبار بصيغة JSON فقط بدون أي شرح إضافي.
 
-            full_prompt = f"""
-أنت نظام توليد اختبارات تعليمية.
-أرجع JSON فقط بدون أي شرح أو نص إضافي.
-
-الصيغة المطلوبة:
+التنسيق الإجباري:
 {{
   "questions": [
     {{
       "q": "نص السؤال",
-      "options": ["أ","ب","ج","د"],
+      "options": ["أ", "ب", "ج", "د"],
       "answer": 0,
       "explanation": "شرح مختصر"
     }}
   ]
 }}
 
-النص:
-{text}
-
-{req.prompt}
+المحتوى:
+{content}
 """
 
-            response = model.generate_content(full_prompt)
-            return response.text
+        model = get_model()
+        response = model.generate_content(prompt)
+        return {"result": response.text}
 
-        except Exception as e:
-            last_error = str(e)
-
-    raise HTTPException(status_code=500, detail=last_error)
-
-@app.post("/ask-file")
-async def ask_file(file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        text = extract_text_from_pdf(content)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid file")
-
-    last_error = None
-
-    for _ in range(len(keys)):
-        try:
-            api_key = next(key_cycle)
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(MODEL_NAME)
-
-            prompt = f"""
-أنشئ 10 أسئلة اختيار من متعدد من النص التالي.
-أرجع JSON فقط بنفس الصيغة:
-
-{{
-  "questions": [
-    {{
-      "q": "السؤال",
-      "options": ["أ","ب","ج","د"],
-      "answer": 0
-    }}
-  ]
-}}
-
-النص:
-{text}
-"""
-
-            response = model.generate_content(prompt)
-            return response.text
-
-        except Exception as e:
-            last_error = str(e)
-
-    raise HTTPException(status_code=500, detail=last_error)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
