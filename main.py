@@ -1,9 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
 import os
 import itertools
+import json
+import re
 
 app = FastAPI()
 
@@ -48,10 +50,19 @@ def ask(req: AskRequest):
 
             model = genai.GenerativeModel("gemini-2.5-flash-lite")
             response = model.generate_content(req.prompt)
+            text = response.text.strip()
 
-            return {"result": response.text}
+            match = re.search(r"\{[\s\S]*\}", text)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except:
+                    pass
+
+            return {"raw": text}
 
         except Exception as e:
             last_error = str(e)
+            continue
 
-    raise HTTPException(status_code=500, detail=last_error)
+    return {"error": last_error}
