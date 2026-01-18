@@ -4,9 +4,12 @@ from pydantic import BaseModel
 import google.generativeai as genai
 import os
 import itertools
-import tempfile
+import json
+import re
 import fitz
-import base64
+from PIL import Image
+import io
+import pytesseract
 
 app = FastAPI()
 
@@ -20,6 +23,8 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     prompt: str
+
+MODEL_NAME = "gemini-2.5-flash-lite"
 
 keys = [
     os.getenv("GEMINI_KEY_1"),
@@ -37,11 +42,25 @@ if not keys:
 
 key_cycle = itertools.cycle(keys)
 
-MODEL_NAME = "gemini-2.5-flash-lite"
+def clean_json(text: str):
+    text = re.sub(r"```json|```", "", text).strip()
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        raise ValueError("No JSON found in model response")
+    return json.loads(match.group())
 
-def get_model():
-    genai.configure(api_key=next(key_cycle))
-    return genai.GenerativeModel(MODEL_NAME)
+def call_gemini(prompt: str):
+    last_error = None
+    for _ in range(len(keys)):
+        try:
+            api_key = next(key_cycle)
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(MODEL_NAME)
+            response = model.generate_content(prompt)
+            return clean_json(response.text)
+        except Exception as e:
+            last_error = str(e)
+    raise RuntimeError(last_error)
 
 @app.get("/")
 def root():
@@ -50,55 +69,56 @@ def root():
 @app.post("/ask")
 def ask(req: AskRequest):
     try:
-        model = get_model()
-        response = model.generate_content(req.prompt)
-        return {"result": response.text}
+        result = call_gemini(req.prompt)
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-def extract_text_from_pdf(path: str) -> str:
-    doc = fitz.open(path)
+def extract_text_from_pdf(file_bytes: bytes):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
     text = ""
     for page in doc:
         text += page.get_text()
     return text
 
+def extract_text_from_image(file_bytes: bytes):
+    image = Image.open(io.BytesIO(file_bytes))
+    return pytesseract.image_to_string(image, lang="ara+eng")
+
 @app.post("/ask-file")
 async def ask_file(file: UploadFile = File(...)):
     try:
-        suffix = os.path.splitext(file.filename)[1]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
+        content = await file.read()
 
-        if suffix.lower() == ".pdf":
-            content = extract_text_from_pdf(tmp_path)
+        if file.content_type == "application/pdf":
+            extracted_text = extract_text_from_pdf(content)
+        elif file.content_type.startswith("image/"):
+            extracted_text = extract_text_from_image(content)
         else:
-            data = base64.b64encode(open(tmp_path, "rb").read()).decode()
-            content = f"IMAGE_BASE64:{data}"
+            raise HTTPException(status_code=400, detail="Unsupported file type")
 
         prompt = f"""
-حول المحتوى التالي إلى أسئلة اختبار بصيغة JSON فقط بدون أي شرح إضافي.
+أنشئ أسئلة اختبار اختيار من متعدد من النص التالي.
+أعد النتيجة بصيغة JSON فقط وبدون أي شرح أو نص إضافي.
 
-التنسيق الإجباري:
+التنسيق:
 {{
   "questions": [
     {{
       "q": "نص السؤال",
-      "options": ["أ", "ب", "ج", "د"],
+      "options": ["أ","ب","ج","د"],
       "answer": 0,
       "explanation": "شرح مختصر"
     }}
   ]
 }}
 
-المحتوى:
-{content}
+النص:
+{extracted_text}
 """
 
-        model = get_model()
-        response = model.generate_content(prompt)
-        return {"result": response.text}
+        result = call_gemini(prompt)
+        return result
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
