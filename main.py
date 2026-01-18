@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
 import os
@@ -6,10 +7,15 @@ import itertools
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class AskRequest(BaseModel):
     prompt: str
-
-GEMINI_MODEL = "models/gemini-2.5-flash-lite"
 
 keys = [
     os.getenv("GEMINI_KEY_1"),
@@ -23,7 +29,7 @@ keys = [
 
 keys = [k for k in keys if k]
 if not keys:
-    raise RuntimeError("No Gemini API keys found in environment variables")
+    raise RuntimeError("No Gemini API keys found")
 
 key_cycle = itertools.cycle(keys)
 
@@ -40,16 +46,12 @@ def ask(req: AskRequest):
             api_key = next(key_cycle)
             genai.configure(api_key=api_key)
 
-            model = genai.GenerativeModel(GEMINI_MODEL)
+            model = genai.GenerativeModel("gemini-2.5-flash-lite")
             response = model.generate_content(req.prompt)
 
             return {"result": response.text}
 
         except Exception as e:
             last_error = str(e)
-            continue
 
-    raise HTTPException(
-        status_code=500,
-        detail=f"All keys failed: {last_error}"
-    )
+    raise HTTPException(status_code=500, detail=last_error)
