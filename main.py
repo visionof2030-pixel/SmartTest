@@ -5,9 +5,6 @@ import google.generativeai as genai
 import os
 import itertools
 import fitz
-from PIL import Image
-import io
-import json
 
 app = FastAPI()
 
@@ -20,6 +17,7 @@ app.add_middleware(
 )
 
 class AskRequest(BaseModel):
+    model: str
     prompt: str
 
 keys = [
@@ -38,12 +36,10 @@ if not keys:
 
 key_cycle = itertools.cycle(keys)
 
-MODEL_NAME = "gemini-2.5-flash-lite"
-
-def get_model():
+def get_model(model_name: str):
     api_key = next(key_cycle)
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel(MODEL_NAME)
+    return genai.GenerativeModel(model_name)
 
 @app.get("/")
 def root():
@@ -52,80 +48,88 @@ def root():
 @app.post("/ask")
 def ask(req: AskRequest):
     try:
-        model = get_model()
-        res = model.generate_content(req.prompt)
-        return {"result": res.text}
+        model = get_model(req.model)
+        response = model.generate_content(req.prompt)
+        return {"result": response.text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
+def pdf_to_text(file_bytes: bytes) -> str:
     text = ""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     for page in doc:
         text += page.get_text()
     return text
 
-def extract_text_from_image(file_bytes: bytes) -> str:
-    img = Image.open(io.BytesIO(file_bytes))
-    model = get_model()
-    res = model.generate_content([
-        "استخرج النص من الصورة التالية بدقة:",
-        img
-    ])
-    return res.text
-
 @app.post("/ask-file")
 async def ask_file(file: UploadFile = File(...)):
     try:
-        data = await file.read()
+        content = await file.read()
+        model_name = "gemini-2.5-flash-lite"
+        model = get_model(model_name)
+
         if file.content_type == "application/pdf":
-            content = extract_text_from_pdf(data)
-        elif file.content_type.startswith("image/"):
-            content = extract_text_from_image(data)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file type")
+            text = pdf_to_text(content)
+            prompt = f"""
+أنشئ اختباراً من النص التالي بصيغة JSON فقط.
 
-        prompt = f"""
-أنت معلم خبير في بناء الاختبارات التعليمية.
+المطلوب:
+- كل سؤال اختيار من متعدد (4 خيارات)
+- لكل خيار شرح مختصر يوضح لماذا هو صحيح أو خاطئ
+- شرح الخيار الصحيح يجب أن يكون موسعاً وتفصيلياً
+- شروحات الخيارات الخاطئة تكون قصيرة
+- لا تضف أي نص خارج JSON
 
-استخرج من النص التالي 10 أسئلة اختيار من متعدد.
-
-شروط مهمة جدًا:
-- كل سؤال يقيس الفهم لا الحفظ
-- كل سؤال يحتوي على 4 خيارات
-- حدد الإجابة الصحيحة
-- التغذية الراجعة يجب أن تكون موسعة (3–6 أسطر) وتشمل:
-  1. لماذا هذه الإجابة صحيحة
-  2. لماذا الخيارات الأخرى خاطئة
-  3. ربط المفهوم بمثال
-  4. تبسيط الفكرة للطالب
-
-النص:
-{content}
-
-صيغة الإخراج (JSON فقط دون أي شرح):
-
+الصيغة المطلوبة:
 {{
   "questions": [
     {{
-      "q": "",
-      "options": ["", "", "", ""],
+      "q": "نص السؤال",
+      "options": ["أ","ب","ج","د"],
       "answer": 0,
-      "explanation": ""
+      "explanations": [
+        "شرح موسع للخيار الصحيح",
+        "شرح مختصر لماذا هذا الخيار خاطئ",
+        "شرح مختصر لماذا هذا الخيار خاطئ",
+        "شرح مختصر لماذا هذا الخيار خاطئ"
+      ]
     }}
   ]
 }}
+
+النص:
+{text}
 """
+            response = model.generate_content(prompt)
+            return {"result": response.text}
 
-        model = get_model()
-        res = model.generate_content(prompt)
-        text = res.text.strip()
+        if file.content_type.startswith("image/"):
+            prompt = """
+حلل الصورة وأنشئ أسئلة اختيار من متعدد بصيغة JSON فقط بنفس الصيغة التالية:
 
-        json_start = text.find("{")
-        json_text = text[json_start:]
-        data = json.loads(json_text)
+{
+  "questions": [
+    {
+      "q": "السؤال",
+      "options": ["أ","ب","ج","د"],
+      "answer": 0,
+      "explanations": [
+        "شرح موسع للخيار الصحيح",
+        "شرح مختصر للخيار الخاطئ",
+        "شرح مختصر للخيار الخاطئ",
+        "شرح مختصر للخيار الخاطئ"
+      ]
+    }
+  ]
+}
+"""
+            response = model.generate_content([
+                prompt,
+                {"mime_type": file.content_type, "data": content}
+            ])
+            return {"result": response.text}
 
-        return data
+        raise HTTPException(status_code=400, detail="نوع الملف غير مدعوم")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
