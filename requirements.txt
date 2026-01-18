@@ -3,3 +3,5 @@ uvicorn
 google-generativeai
 python-multipart
 pymupdf
+pytesseract
+pillow
