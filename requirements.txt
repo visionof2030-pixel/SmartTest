@@ -2,7 +2,3 @@ fastapi
 uvicorn
 google-generativeai
 python-multipart
-pymupdf
-python-docx
-pillow
-pytesseract
