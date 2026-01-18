@@ -1,24 +1,26 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import google.generativeai as genai
 import os
 import itertools
-import fitz
+import base64
+import tempfile
+import pdfplumber
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ================== Models ==================
 
 class AskRequest(BaseModel):
-    model: str
     prompt: str
+    model: str = "gemini-2.5-flash-lite"
+
+class FileAnalyzeRequest(BaseModel):
+    file: str
+    fileType: str
+    mimeType: str
+
+# ================== API KEYS ==================
 
 keys = [
     os.getenv("GEMINI_KEY_1"),
@@ -36,63 +38,75 @@ if not keys:
 
 key_cycle = itertools.cycle(keys)
 
-def get_model(model_name: str):
-    api_key = next(key_cycle)
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel(model_name)
+def ask_gemini(prompt: str, model_name: str = "gemini-2.5-flash-lite"):
+    last_error = None
+    for _ in range(len(keys)):
+        try:
+            api_key = next(key_cycle)
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_name)
+            r = model.generate_content(prompt)
+            return r.text
+        except Exception as e:
+            last_error = str(e)
+    raise HTTPException(status_code=500, detail=f"All keys failed: {last_error}")
+
+# ================== Utils ==================
+
+def extract_text_from_pdf(b64: str) -> str:
+    pdf_bytes = base64.b64decode(b64)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
+        f.write(pdf_bytes)
+        path = f.name
+
+    text = ""
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                text += t + "\n"
+    return text.strip()
+
+# ================== Endpoints ==================
 
 @app.get("/")
 def root():
     return {"status": "ok"}
 
+# --------- Manual Prompt ---------
 @app.post("/ask")
 def ask(req: AskRequest):
-    try:
-        model = get_model(req.model)
-        response = model.generate_content(req.prompt)
-        return {"result": response.text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = ask_gemini(req.prompt, req.model)
+    return {"result": result}
 
-def pdf_to_text(file_bytes: bytes) -> str:
-    text = ""
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    for page in doc:
-        text += page.get_text()
-    return text
+# --------- Analyze PDF (Questions) ---------
+@app.post("/analyze-file")
+def analyze_file(req: FileAnalyzeRequest):
+    if req.fileType != "pdf":
+        raise HTTPException(status_code=400, detail="Only PDF supported")
 
-@app.post("/ask-file")
-async def ask_file(file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        model_name = "gemini-2.5-flash-lite"
-        model = get_model(model_name)
+    text = extract_text_from_pdf(req.file)
 
-        if file.content_type == "application/pdf":
-            text = pdf_to_text(content)
-            prompt = f"""
-أنشئ اختباراً من النص التالي بصيغة JSON فقط.
+    prompt = f"""
+أنت خبير تقويم تعليمي.
+اقرأ النص التالي ثم أنشئ أسئلة تقيس الفهم العميق وليس الحفظ.
 
-المطلوب:
-- كل سؤال اختيار من متعدد (4 خيارات)
-- لكل خيار شرح مختصر يوضح لماذا هو صحيح أو خاطئ
-- شرح الخيار الصحيح يجب أن يكون موسعاً وتفصيلياً
-- شروحات الخيارات الخاطئة تكون قصيرة
-- لا تضف أي نص خارج JSON
+قواعد صارمة:
+- لا تكرر نفس الفكرة بصياغة مختلفة
+- كل سؤال يقيس فكرة مختلفة
+- التغذية الراجعة للإجابة الصحيحة تكون موسعة ومفصلة
+- التغذية الراجعة للإجابات الخاطئة مختصرة وتوضيحية
+- الأسئلة تعليمية وليست مباشرة
 
-الصيغة المطلوبة:
+أعد النتيجة JSON فقط بهذا الشكل:
 {{
   "questions": [
     {{
-      "q": "نص السؤال",
-      "options": ["أ","ب","ج","د"],
+      "q": "السؤال",
+      "options": ["أ", "ب", "ج", "د"],
       "answer": 0,
-      "explanations": [
-        "شرح موسع للخيار الصحيح",
-        "شرح مختصر لماذا هذا الخيار خاطئ",
-        "شرح مختصر لماذا هذا الخيار خاطئ",
-        "شرح مختصر لماذا هذا الخيار خاطئ"
-      ]
+      "explanation_correct": "شرح موسع للإجابة الصحيحة",
+      "explanation_wrong": "سبب خطأ الخيارات الأخرى"
     }}
   ]
 }}
@@ -100,36 +114,43 @@ async def ask_file(file: UploadFile = File(...)):
 النص:
 {text}
 """
-            response = model.generate_content(prompt)
-            return {"result": response.text}
 
-        if file.content_type.startswith("image/"):
-            prompt = """
-حلل الصورة وأنشئ أسئلة اختيار من متعدد بصيغة JSON فقط بنفس الصيغة التالية:
+    result = ask_gemini(prompt)
+    return {"result": result}
 
-{
-  "questions": [
-    {
-      "q": "السؤال",
-      "options": ["أ","ب","ج","د"],
-      "answer": 0,
-      "explanations": [
-        "شرح موسع للخيار الصحيح",
-        "شرح مختصر للخيار الخاطئ",
-        "شرح مختصر للخيار الخاطئ",
-        "شرح مختصر للخيار الخاطئ"
-      ]
-    }
-  ]
-}
+# --------- Summarize PDF (Smart Summary) ---------
+@app.post("/summarize-file")
+def summarize_file(req: FileAnalyzeRequest):
+    if req.fileType != "pdf":
+        raise HTTPException(status_code=400, detail="Only PDF supported")
+
+    text = extract_text_from_pdf(req.file)
+
+    prompt = f"""
+أنت خبير في التلخيص الأكاديمي الذكي.
+
+مهمتك:
+تلخيص النص التالي دون تكرار الأفكار مع دمج المتشابه منها.
+لا تختصر بجمل قصيرة، بل قدم تلخيصاً تعليمياً منظمًا.
+
+قواعد صارمة:
+- لا تكرر نفس المعنى بصياغات مختلفة
+- اجمع الأفكار المتشابهة في فكرة واحدة
+- استخدم عناوين واضحة
+- اجعل التلخيص تدريجياً من العام إلى الخاص
+- لا تفقد أي فكرة جوهرية
+- لا تضف معلومات غير موجودة
+- استخدم أسلوب تعليمي موجه للطلاب
+
+التنسيق المطلوب:
+- عنوان رئيسي
+- عناوين فرعية
+- نقاط مركزة
+- فقرات قصيرة واضحة
+
+النص:
+{text}
 """
-            response = model.generate_content([
-                prompt,
-                {"mime_type": file.content_type, "data": content}
-            ])
-            return {"result": response.text}
 
-        raise HTTPException(status_code=400, detail="نوع الملف غير مدعوم")
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = ask_gemini(prompt)
+    return {"result": result}
