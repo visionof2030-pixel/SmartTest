@@ -7,8 +7,9 @@ import itertools
 app = FastAPI()
 
 class AskRequest(BaseModel):
-    model: str
     prompt: str
+
+GEMINI_MODEL = "models/gemini-2.5-flash-lite"
 
 keys = [
     os.getenv("GEMINI_KEY_1"),
@@ -38,11 +39,17 @@ def ask(req: AskRequest):
         try:
             api_key = next(key_cycle)
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(req.model)
+
+            model = genai.GenerativeModel(GEMINI_MODEL)
             response = model.generate_content(req.prompt)
+
             return {"result": response.text}
+
         except Exception as e:
             last_error = str(e)
             continue
 
-    raise HTTPException(status_code=500, detail=f"All keys failed: {last_error}")
+    raise HTTPException(
+        status_code=500,
+        detail=f"All keys failed: {last_error}"
+    )
