@@ -4,12 +4,10 @@ from pydantic import BaseModel
 import google.generativeai as genai
 import os
 import itertools
-import json
-import re
 import fitz
 from PIL import Image
 import io
-import pytesseract
+import json
 
 app = FastAPI()
 
@@ -23,8 +21,6 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     prompt: str
-
-MODEL_NAME = "gemini-2.5-flash-lite"
 
 keys = [
     os.getenv("GEMINI_KEY_1"),
@@ -42,25 +38,12 @@ if not keys:
 
 key_cycle = itertools.cycle(keys)
 
-def clean_json(text: str):
-    text = re.sub(r"```json|```", "", text).strip()
-    match = re.search(r"\{[\s\S]*\}", text)
-    if not match:
-        raise ValueError("No JSON found in model response")
-    return json.loads(match.group())
+MODEL_NAME = "gemini-2.5-flash-lite"
 
-def call_gemini(prompt: str):
-    last_error = None
-    for _ in range(len(keys)):
-        try:
-            api_key = next(key_cycle)
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(MODEL_NAME)
-            response = model.generate_content(prompt)
-            return clean_json(response.text)
-        except Exception as e:
-            last_error = str(e)
-    raise RuntimeError(last_error)
+def get_model():
+    api_key = next(key_cycle)
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(MODEL_NAME)
 
 @app.get("/")
 def root():
@@ -69,56 +52,80 @@ def root():
 @app.post("/ask")
 def ask(req: AskRequest):
     try:
-        result = call_gemini(req.prompt)
-        return result
+        model = get_model()
+        res = model.generate_content(req.prompt)
+        return {"result": res.text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-def extract_text_from_pdf(file_bytes: bytes):
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
+def extract_text_from_pdf(file_bytes: bytes) -> str:
     text = ""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
     for page in doc:
         text += page.get_text()
     return text
 
-def extract_text_from_image(file_bytes: bytes):
-    image = Image.open(io.BytesIO(file_bytes))
-    return pytesseract.image_to_string(image, lang="ara+eng")
+def extract_text_from_image(file_bytes: bytes) -> str:
+    img = Image.open(io.BytesIO(file_bytes))
+    model = get_model()
+    res = model.generate_content([
+        "استخرج النص من الصورة التالية بدقة:",
+        img
+    ])
+    return res.text
 
 @app.post("/ask-file")
 async def ask_file(file: UploadFile = File(...)):
     try:
-        content = await file.read()
-
+        data = await file.read()
         if file.content_type == "application/pdf":
-            extracted_text = extract_text_from_pdf(content)
+            content = extract_text_from_pdf(data)
         elif file.content_type.startswith("image/"):
-            extracted_text = extract_text_from_image(content)
+            content = extract_text_from_image(data)
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type")
 
         prompt = f"""
-أنشئ أسئلة اختبار اختيار من متعدد من النص التالي.
-أعد النتيجة بصيغة JSON فقط وبدون أي شرح أو نص إضافي.
+أنت معلم خبير في بناء الاختبارات التعليمية.
 
-التنسيق:
+استخرج من النص التالي 10 أسئلة اختيار من متعدد.
+
+شروط مهمة جدًا:
+- كل سؤال يقيس الفهم لا الحفظ
+- كل سؤال يحتوي على 4 خيارات
+- حدد الإجابة الصحيحة
+- التغذية الراجعة يجب أن تكون موسعة (3–6 أسطر) وتشمل:
+  1. لماذا هذه الإجابة صحيحة
+  2. لماذا الخيارات الأخرى خاطئة
+  3. ربط المفهوم بمثال
+  4. تبسيط الفكرة للطالب
+
+النص:
+{content}
+
+صيغة الإخراج (JSON فقط دون أي شرح):
+
 {{
   "questions": [
     {{
-      "q": "نص السؤال",
-      "options": ["أ","ب","ج","د"],
+      "q": "",
+      "options": ["", "", "", ""],
       "answer": 0,
-      "explanation": "شرح مختصر"
+      "explanation": ""
     }}
   ]
 }}
-
-النص:
-{extracted_text}
 """
 
-        result = call_gemini(prompt)
-        return result
+        model = get_model()
+        res = model.generate_content(prompt)
+        text = res.text.strip()
+
+        json_start = text.find("{")
+        json_text = text[json_start:]
+        data = json.loads(json_text)
+
+        return data
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
