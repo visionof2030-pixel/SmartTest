@@ -2,9 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
-import os
-import itertools
-import io
+import os, itertools, io
 import pdfplumber
 from PIL import Image
 
@@ -19,8 +17,6 @@ app.add_middleware(
 )
 
 MODEL = "gemini-2.5-flash-lite"
-MAX_QUESTIONS = 60
-MAX_TEXT_CHARS = 12000
 
 keys = [
     os.getenv("GEMINI_KEY_1"),
@@ -41,11 +37,11 @@ def get_model():
     genai.configure(api_key=next(key_cycle))
     return genai.GenerativeModel(MODEL)
 
-def lang_instruction(lang: str):
+def lang_instruction(lang):
     return (
         "Write the final output in clear academic English."
         if lang == "en"
-        else "اكتب الناتج النهائي باللغة العربية الفصحى."
+        else "اكتب الناتج النهائي باللغة العربية الفصحى الواضحة."
     )
 
 def extract_text_from_pdf(data: bytes):
@@ -63,7 +59,7 @@ def prepare_image(data: bytes):
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-class ManualQuizRequest(BaseModel):
+class AskRequest(BaseModel):
     prompt: str
     language: str = "ar"
     total_questions: int = 10
@@ -72,25 +68,23 @@ class ManualQuizRequest(BaseModel):
 def root():
     return {"status": "ok"}
 
+# ---------- اختبار يدوي ----------
 @app.post("/ask")
-def manual_quiz(req: ManualQuizRequest):
-    if req.total_questions < 1 or req.total_questions > MAX_QUESTIONS:
-        raise HTTPException(status_code=400, detail="Invalid number of questions")
-
-    model = get_model()
+def ask(req: AskRequest):
+    tq = min(max(req.total_questions, 5), 60)
 
     prompt = f"""
 {lang_instruction(req.language)}
 
-أنشئ {req.total_questions} سؤال اختيار من متعدد من الموضوع التالي.
+أنشئ {tq} سؤال اختيار من متعدد من الموضوع التالي.
 
 قواعد صارمة:
 - 4 خيارات لكل سؤال
-- شرح موسع للإجابة الصحيحة
-- شرح مختصر لكل خيار خاطئ
-- لا تكرر الأفكار أو الأسئلة
-- غطِّ الموضوع بالكامل
-- أعد JSON فقط بدون أي رموز إضافية
+- شرح موسع وعميق للإجابة الصحيحة
+- شرح مختصر ومباشر لكل خيار خاطئ
+- لا تكرر الأفكار
+- مستوى تعليمي واضح
+- أعد JSON فقط
 
 الصيغة:
 {{
@@ -107,20 +101,19 @@ def manual_quiz(req: ManualQuizRequest):
 الموضوع:
 {req.prompt}
 """
-
+    model = get_model()
     r = model.generate_content(prompt)
     return {"result": r.text}
 
+# ---------- من ملف ----------
 @app.post("/ask-file")
 async def ask_file(
     file: UploadFile = File(...),
     mode: str = Form("questions"),
     language: str = Form("ar"),
-    num_questions: int = Form(10),
+    num_questions: int = Form(10)
 ):
-    if num_questions < 1 or num_questions > MAX_QUESTIONS:
-        raise HTTPException(status_code=400, detail="Invalid number of questions")
-
+    num_questions = min(max(num_questions, 5), 60)
     data = await file.read()
     model = get_model()
 
@@ -128,60 +121,84 @@ async def ask_file(
     image = None
 
     name = file.filename.lower()
-
     if name.endswith(".pdf"):
-        extracted = extract_text_from_pdf(data)
-        if extracted:
-            text = extracted[:MAX_TEXT_CHARS]
-        else:
-            image = data
+        text = extract_text_from_pdf(data)
+        if not text:
+            raise HTTPException(400, "PDF has no readable text")
     elif name.endswith((".png", ".jpg", ".jpeg")):
         image = prepare_image(data)
     else:
-        raise HTTPException(status_code=400, detail="Unsupported file type")
+        raise HTTPException(400, "Unsupported file type")
 
+    # ---------- تلخيص ----------
     if mode == "summary":
         prompt = f"""
 {lang_instruction(language)}
 
-لخص المحتوى التالي تلخيصًا احترافيًا منظمًا بصريًا.
+لخص المحتوى التالي بأسلوب تعليمي منسق بصريًا.
 
 قواعد:
-- لا تكرار للأفكار
-- كل فكرة مستقلة
-- صياغة تعليمية واضحة
-- بدون رموز مثل *** أو ###
-- استخدم تنسيقًا نظيفًا
+- كل فكرة في فقرة مستقلة
+- لا تكرار
+- لا رموز *** أو ----
+- لغة واضحة
+- مناسب للطلاب
 
-الناتج:
-- ملخص عام
-- الأفكار الرئيسية
-- النقاط المهمة
+المخرجات:
+- عنوان
+- فقرات ملونة (HTML spans)
 - خلاصة نهائية
 """
-        if text:
-            r = model.generate_content(prompt + "\n" + text)
-        else:
-            r = model.generate_content(
-                [
-                    prompt,
-                    {"mime_type": file.content_type, "data": image},
-                ]
-            )
+        r = (
+            model.generate_content(prompt + "\n" + text[:14000])
+            if text
+            else model.generate_content([prompt, {"mime_type": file.content_type, "data": image}])
+        )
         return {"result": r.text}
 
+    # ---------- Flash Cards ----------
+    if mode == "flashcards":
+        prompt = f"""
+{lang_instruction(language)}
+
+أنشئ بطاقات تعليمية Flash Cards من المحتوى التالي.
+
+قواعد:
+- فكرة واحدة لكل بطاقة
+- لا تكرار
+- صياغة تعليمية مختصرة
+- أعد JSON فقط
+
+الصيغة:
+{{
+ "cards":[
+  {{
+   "front":"",
+   "back":""
+  }}
+ ]
+}}
+"""
+        r = (
+            model.generate_content(prompt + "\n" + text[:14000])
+            if text
+            else model.generate_content([prompt, {"mime_type": file.content_type, "data": image}])
+        )
+        return {"result": r.text}
+
+    # ---------- أسئلة من ملف ----------
     prompt = f"""
 {lang_instruction(language)}
 
 أنشئ {num_questions} سؤال اختيار من متعدد من المحتوى التالي.
 
-قواعد صارمة:
-- 4 خيارات لكل سؤال
+قواعد:
+- 4 خيارات
 - شرح موسع للإجابة الصحيحة
-- شرح مختصر لكل خيار خاطئ
-- غطِّ جميع الأفكار المهمة
-- لا تكرر الأسئلة
-- أعد JSON فقط بدون أي نص إضافي
+- شرح مختصر للخاطئة
+- لا تكرر
+- غطِّ جميع الأفكار
+- أعد JSON فقط
 
 الصيغة:
 {{
@@ -195,15 +212,9 @@ async def ask_file(
  ]
 }}
 """
-
-    if text:
-        r = model.generate_content(prompt + "\n" + text)
-    else:
-        r = model.generate_content(
-            [
-                prompt,
-                {"mime_type": file.content_type, "data": image},
-            ]
-        )
-
+    r = (
+        model.generate_content(prompt + "\n" + text[:14000])
+        if text
+        else model.generate_content([prompt, {"mime_type": file.content_type, "data": image}])
+    )
     return {"result": r.text}
