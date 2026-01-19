@@ -19,6 +19,8 @@ app.add_middleware(
 )
 
 MODEL = "gemini-2.5-flash-lite"
+MAX_QUESTIONS = 60
+MAX_TEXT_CHARS = 12000
 
 keys = [
     os.getenv("GEMINI_KEY_1"),
@@ -72,19 +74,23 @@ def root():
 
 @app.post("/ask")
 def manual_quiz(req: ManualQuizRequest):
-    total = min(max(req.total_questions, 5), 60)
+    if req.total_questions < 1 or req.total_questions > MAX_QUESTIONS:
+        raise HTTPException(status_code=400, detail="Invalid number of questions")
+
     model = get_model()
+
     prompt = f"""
 {lang_instruction(req.language)}
 
-أنشئ {total} سؤال اختيار من متعدد من الموضوع التالي.
+أنشئ {req.total_questions} سؤال اختيار من متعدد من الموضوع التالي.
 
 قواعد صارمة:
 - 4 خيارات لكل سؤال
 - شرح موسع للإجابة الصحيحة
 - شرح مختصر لكل خيار خاطئ
-- لا تكرر الأفكار
-- أعد JSON فقط
+- لا تكرر الأفكار أو الأسئلة
+- غطِّ الموضوع بالكامل
+- أعد JSON فقط بدون أي رموز إضافية
 
 الصيغة:
 {{
@@ -101,6 +107,7 @@ def manual_quiz(req: ManualQuizRequest):
 الموضوع:
 {req.prompt}
 """
+
     r = model.generate_content(prompt)
     return {"result": r.text}
 
@@ -109,9 +116,11 @@ async def ask_file(
     file: UploadFile = File(...),
     mode: str = Form("questions"),
     language: str = Form("ar"),
-    num_questions: int = Form(10)
+    num_questions: int = Form(10),
 ):
-    num_questions = min(max(num_questions, 5), 60)
+    if num_questions < 1 or num_questions > MAX_QUESTIONS:
+        raise HTTPException(status_code=400, detail="Invalid number of questions")
+
     data = await file.read()
     model = get_model()
 
@@ -119,11 +128,13 @@ async def ask_file(
     image = None
 
     name = file.filename.lower()
+
     if name.endswith(".pdf"):
-        text = extract_text_from_pdf(data)
-        if not text:
-            raise HTTPException(status_code=400, detail="PDF has no readable text")
-        text = text[:15000]
+        extracted = extract_text_from_pdf(data)
+        if extracted:
+            text = extracted[:MAX_TEXT_CHARS]
+        else:
+            image = data
     elif name.endswith((".png", ".jpg", ".jpeg")):
         image = prepare_image(data)
     else:
@@ -133,43 +144,30 @@ async def ask_file(
         prompt = f"""
 {lang_instruction(language)}
 
-اكتب تلخيصًا تعليميًا احترافيًا ومنظمًا بصريًا باستخدام HTML فقط.
+لخص المحتوى التالي تلخيصًا احترافيًا منظمًا بصريًا.
 
-قواعد إلزامية:
-- لا تستخدم *** أو ### أو أي رموز تنسيق
-- كل قسم بلون مختلف
-- فقرات قصيرة
-- بدون تكرار
+قواعد:
+- لا تكرار للأفكار
+- كل فكرة مستقلة
+- صياغة تعليمية واضحة
+- بدون رموز مثل *** أو ###
+- استخدم تنسيقًا نظيفًا
 
-هيكل الإخراج:
-
-<div>
-
-<h3 style="color:#1A5F7A">الملخص العام</h3>
-<p style="color:#333">...</p>
-
-<h3 style="color:#159895">الأفكار الرئيسية</h3>
-<ul>
-<li style="color:#0F766E">...</li>
-</ul>
-
-<h3 style="color:#4CAF50">أمثلة توضيحية</h3>
-<ul>
-<li style="color:#166534">...</li>
-</ul>
-
-<h3 style="color:#DC2626">الخلاصة التعليمية</h3>
-<p style="color:#7F1D1D">...</p>
-
-</div>
+الناتج:
+- ملخص عام
+- الأفكار الرئيسية
+- النقاط المهمة
+- خلاصة نهائية
 """
         if text:
             r = model.generate_content(prompt + "\n" + text)
         else:
-            r = model.generate_content([
-                prompt,
-                {"mime_type": file.content_type, "data": image}
-            ])
+            r = model.generate_content(
+                [
+                    prompt,
+                    {"mime_type": file.content_type, "data": image},
+                ]
+            )
         return {"result": r.text}
 
     prompt = f"""
@@ -183,7 +181,7 @@ async def ask_file(
 - شرح مختصر لكل خيار خاطئ
 - غطِّ جميع الأفكار المهمة
 - لا تكرر الأسئلة
-- أعد JSON فقط
+- أعد JSON فقط بدون أي نص إضافي
 
 الصيغة:
 {{
@@ -201,9 +199,11 @@ async def ask_file(
     if text:
         r = model.generate_content(prompt + "\n" + text)
     else:
-        r = model.generate_content([
-            prompt,
-            {"mime_type": file.content_type, "data": image}
-        ])
+        r = model.generate_content(
+            [
+                prompt,
+                {"mime_type": file.content_type, "data": image},
+            ]
+        )
 
     return {"result": r.text}
