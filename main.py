@@ -1,221 +1,184 @@
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>المنصة الذكية للاختبارات والتلخيص</title>
-<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap" rel="stylesheet">
-<style>
-body{font-family:Tajawal;background:#0A3D62;color:white;padding:20px;margin:0}
-.container{max-width:950px;margin:auto;background:#1A5F7A;padding:25px;border-radius:15px}
-select,input,textarea,button{width:100%;padding:10px;margin:6px 0;border-radius:6px;border:none}
-button{cursor:pointer;font-size:16px;background:#159895;color:white}
-.option{border:1px solid #ccc;padding:12px;margin:8px 0;cursor:pointer;border-radius:6px}
-.option.correct{background:#2e7d32}
-.option.incorrect{background:#c62828}
-.feedback{background:#0f766e;padding:10px;margin-top:5px;border-radius:6px;font-size:14px}
-.hidden{display:none}
-.tabs{display:flex;gap:10px;margin-bottom:15px}
-.tabs button{flex:1}
-.box{background:#0b2e4a;padding:20px;border-radius:10px;margin-top:15px;white-space:pre-wrap;line-height:1.8}
-</style>
-</head>
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import google.generativeai as genai
+import os
+import itertools
+import io
+import pdfplumber
+from PIL import Image
 
-<body>
+app = FastAPI()
 
-<div class="container">
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-<div class="tabs">
-<button onclick="showTab('manual')">✍️ اختبار يدوي</button>
-<button onclick="showTab('file')">📄 اختبار من ملف</button>
-<button onclick="showTab('summary')">🧾 تلخيص ملف</button>
-</div>
+MODEL = "gemini-2.5-flash-lite"
 
-<!-- اختبار يدوي -->
-<div id="manual">
-<textarea id="topic" placeholder="اكتب موضوع الاختبار"></textarea>
+keys = [
+    os.getenv("GEMINI_KEY_1"),
+    os.getenv("GEMINI_KEY_2"),
+    os.getenv("GEMINI_KEY_3"),
+    os.getenv("GEMINI_KEY_4"),
+    os.getenv("GEMINI_KEY_5"),
+    os.getenv("GEMINI_KEY_6"),
+    os.getenv("GEMINI_KEY_7"),
+]
+keys = [k for k in keys if k]
+if not keys:
+    raise RuntimeError("No Gemini API keys found")
 
-<select id="manualCount">
-<option value="5">5</option>
-<option value="10" selected>10</option>
-<option value="20">20</option>
-<option value="30">30</option>
-<option value="40">40</option>
-<option value="50">50</option>
-<option value="60">60</option>
-</select>
+key_cycle = itertools.cycle(keys)
 
-<select id="lang">
-<option value="ar">عربي</option>
-<option value="en">English</option>
-</select>
+def get_model():
+    genai.configure(api_key=next(key_cycle))
+    return genai.GenerativeModel(MODEL)
 
-<button onclick="manualQuiz()">إنشاء الاختبار</button>
-</div>
+def lang_instruction(lang: str):
+    return "Write the final output in clear academic English." if lang == "en" else "اكتب الناتج النهائي باللغة العربية الفصحى."
 
-<!-- اختبار من ملف -->
-<div id="file" class="hidden">
-<input type="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg">
+def extract_text_from_pdf(data: bytes):
+    text = ""
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                text += t + "\n"
+    return text.strip()
 
-<select id="fileCount">
-<option value="5">5</option>
-<option value="10" selected>10</option>
-<option value="20">20</option>
-<option value="30">30</option>
-<option value="40">40</option>
-<option value="50">50</option>
-<option value="60">60</option>
-</select>
+def prepare_image(data: bytes):
+    img = Image.open(io.BytesIO(data))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
-<select id="fileLang">
-<option value="ar">عربي</option>
-<option value="en">English</option>
-</select>
+class AskRequest(BaseModel):
+    prompt: str
+    language: str = "ar"
 
-<button onclick="fileQuiz()">إنشاء الأسئلة</button>
-</div>
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
-<!-- تلخيص -->
-<div id="summary" class="hidden">
-<input type="file" id="sumFile" accept=".pdf,.png,.jpg,.jpeg">
-<select id="sumLang">
-<option value="ar">عربي</option>
-<option value="en">English</option>
-</select>
-<button onclick="summarize()">تلخيص الملف</button>
-</div>
+@app.post("/ask")
+def ask(req: AskRequest):
+    model = get_model()
+    prompt = f"""
+{lang_instruction(req.language)}
 
-<div id="result"></div>
-<button id="nextBtn" class="hidden" onclick="nextQuestion()">التالي</button>
+أنشئ اختبار اختيار من متعدد من الموضوع التالي.
 
-</div>
+قواعد صارمة:
+- عدد مناسب من الأسئلة حسب عمق الموضوع
+- 4 خيارات لكل سؤال
+- شرح موسع للإجابة الصحيحة
+- شرح مختصر لكل خيار خاطئ
+- لا تكرر الأفكار
+- أعد JSON فقط
 
-<script>
-const BACKEND="https://smarttest-0ycc.onrender.com"
-let questions=[]
-let answers=[]
-let index=0
+الصيغة:
+{{
+ "questions":[
+  {{
+   "q":"",
+   "options":["","","",""],
+   "answer":0,
+   "explanations":["","","",""]
+  }}
+ ]
+}}
 
-function showTab(t){
-["manual","file","summary"].forEach(x=>document.getElementById(x).classList.add("hidden"))
-document.getElementById(t).classList.remove("hidden")
-result.innerHTML=""
-nextBtn.classList.add("hidden")
-}
+الموضوع:
+{req.prompt}
+"""
+    r = model.generate_content(prompt)
+    return {"result": r.text}
 
-function safeParse(t){
-return JSON.parse(t.replace(/```json|```/g,"").trim())
-}
+@app.post("/ask-file")
+async def ask_file(
+    file: UploadFile = File(...),
+    mode: str = Form("questions"),
+    language: str = Form("ar"),
+    num_questions: int = Form(10)
+):
+    data = await file.read()
+    model = get_model()
 
-async function manualQuiz(){
-const count = manualCount.value
+    text = None
+    image = None
 
-const prompt = `
-أنشئ اختبار مكوّن من ${count} سؤال اختيار من متعدد حول الموضوع التالي:
-${topic.value}
+    name = file.filename.lower()
+    if name.endswith(".pdf"):
+        text = extract_text_from_pdf(data)
+        if not text:
+            raise HTTPException(status_code=400, detail="PDF has no readable text")
+    elif name.endswith((".png", ".jpg", ".jpeg")):
+        image = prepare_image(data)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file type")
+
+    if mode == "summary":
+        prompt = f"""
+{lang_instruction(language)}
+
+لخص المحتوى التالي بدون تكرار:
+- دمج الأفكار المتشابهة
+- تنظيم المحتوى
+- صياغة تعليمية واضحة
+- لا تطِل بدون فائدة
+
+الناتج:
+1. ملخص عام
+2. الأفكار الرئيسية
+3. النقاط المهمة
+4. خلاصة نهائية
+"""
+        if text:
+            r = model.generate_content(prompt + "\n" + text[:12000])
+        else:
+            r = model.generate_content([
+                prompt,
+                {"mime_type": file.content_type, "data": image}
+            ])
+        return {"result": r.text}
+
+    prompt = f"""
+{lang_instruction(language)}
+
+أنشئ {num_questions} سؤال اختيار من متعدد من المحتوى التالي.
 
 قواعد صارمة:
 - 4 خيارات لكل سؤال
 - شرح موسع للإجابة الصحيحة
 - شرح مختصر لكل خيار خاطئ
-- لا تكرر الأفكار
-- لا تخرج عن الموضوع
-- أعد النتيجة JSON فقط
+- غطِّ جميع الأفكار المهمة
+- لا تكرر الأسئلة
+- أعد JSON فقط
 
 الصيغة:
-{
+{{
  "questions":[
-  {
+  {{
    "q":"",
    "options":["","","",""],
    "answer":0,
    "explanations":["","","",""]
-  }
+  }}
  ]
-}
-`
+}}
+"""
 
-const r = await fetch(BACKEND+"/ask",{
-method:"POST",
-headers:{"Content-Type":"application/json"},
-body:JSON.stringify({prompt,language:lang.value})
-})
+    if text:
+        r = model.generate_content(prompt + "\n" + text[:12000])
+    else:
+        r = model.generate_content([
+            prompt,
+            {"mime_type": file.content_type, "data": image}
+        ])
 
-const d = await r.json()
-questions = safeParse(d.result).questions
-answers = new Array(questions.length).fill(null)
-index = 0
-nextBtn.classList.remove("hidden")
-renderQuestion()
-}
-
-async function fileQuiz(){
-const fd=new FormData()
-fd.append("file",fileInput.files[0])
-fd.append("mode","questions")
-fd.append("language",fileLang.value)
-fd.append("num_questions", fileCount.value)
-
-const r = await fetch(BACKEND+"/ask-file",{method:"POST",body:fd})
-const d = await r.json()
-questions = safeParse(d.result).questions
-answers = new Array(questions.length).fill(null)
-index = 0
-nextBtn.classList.remove("hidden")
-renderQuestion()
-}
-
-async function summarize(){
-const fd=new FormData()
-fd.append("file",sumFile.files[0])
-fd.append("mode","summary")
-fd.append("language",sumLang.value)
-
-const r = await fetch(BACKEND+"/ask-file",{method:"POST",body:fd})
-const d = await r.json()
-
-result.innerHTML = `<div class="box">${d.result}</div>`
-}
-
-function renderQuestion(){
-const q=questions[index]
-let html=`<h3>${q.q}</h3>`
-
-q.options.forEach((o,i)=>{
-let cls="option"
-if(answers[index]!==null){
-if(i===q.answer) cls+=" correct"
-else cls+=" incorrect"
-}
-
-html+=`
-<div class="${cls}" onclick="choose(${i})">
-${o}
-${answers[index]!==null ? `<div class="feedback">${q.explanations[i]}</div>` : ""}
-</div>`
-})
-
-result.innerHTML = html
-}
-
-function choose(i){
-if(answers[index]!==null) return
-answers[index]=i
-renderQuestion()
-}
-
-function nextQuestion(){
-if(index < questions.length-1){
-index++
-renderQuestion()
-}else{
-let correct=0
-answers.forEach((a,i)=>{if(a===questions[i].answer) correct++})
-result.innerHTML = `<h2>النتيجة: ${correct} / ${questions.length}</h2>`
-nextBtn.classList.add("hidden")
-}
-}
-</script>
-
-</body>
-</html>
+    return {"result": r.text}
