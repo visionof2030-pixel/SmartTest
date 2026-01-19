@@ -1,191 +1,221 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-import google.generativeai as genai
-import os
-import itertools
-import math
-import json
-import re
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>المنصة الذكية للاختبارات والتلخيص</title>
+<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap" rel="stylesheet">
+<style>
+body{font-family:Tajawal;background:#0A3D62;color:white;padding:20px;margin:0}
+.container{max-width:950px;margin:auto;background:#1A5F7A;padding:25px;border-radius:15px}
+select,input,textarea,button{width:100%;padding:10px;margin:6px 0;border-radius:6px;border:none}
+button{cursor:pointer;font-size:16px;background:#159895;color:white}
+.option{border:1px solid #ccc;padding:12px;margin:8px 0;cursor:pointer;border-radius:6px}
+.option.correct{background:#2e7d32}
+.option.incorrect{background:#c62828}
+.feedback{background:#0f766e;padding:10px;margin-top:5px;border-radius:6px;font-size:14px}
+.hidden{display:none}
+.tabs{display:flex;gap:10px;margin-bottom:15px}
+.tabs button{flex:1}
+.box{background:#0b2e4a;padding:20px;border-radius:10px;margin-top:15px;white-space:pre-wrap;line-height:1.8}
+</style>
+</head>
 
-app = FastAPI()
+<body>
 
-class AskRequest(BaseModel):
-    prompt: str = Field(..., min_length=3)
-    language: str = Field(default="ar")
-    total_questions: int = Field(default=10, ge=5, le=60)
+<div class="container">
 
-class FileQuizRequest(BaseModel):
-    content: str = Field(..., min_length=20)
-    language: str = Field(default="ar")
-    total_questions: int = Field(default=10, ge=5, le=60)
+<div class="tabs">
+<button onclick="showTab('manual')">✍️ اختبار يدوي</button>
+<button onclick="showTab('file')">📄 اختبار من ملف</button>
+<button onclick="showTab('summary')">🧾 تلخيص ملف</button>
+</div>
 
-class SummaryRequest(BaseModel):
-    content: str = Field(..., min_length=20)
-    language: str = Field(default="ar")
+<!-- اختبار يدوي -->
+<div id="manual">
+<textarea id="topic" placeholder="اكتب موضوع الاختبار"></textarea>
 
-keys = [
-    os.getenv("GEMINI_KEY_1"),
-    os.getenv("GEMINI_KEY_2"),
-    os.getenv("GEMINI_KEY_3"),
-    os.getenv("GEMINI_KEY_4"),
-    os.getenv("GEMINI_KEY_5"),
-    os.getenv("GEMINI_KEY_6"),
-    os.getenv("GEMINI_KEY_7"),
-]
+<select id="manualCount">
+<option value="5">5</option>
+<option value="10" selected>10</option>
+<option value="20">20</option>
+<option value="30">30</option>
+<option value="40">40</option>
+<option value="50">50</option>
+<option value="60">60</option>
+</select>
 
-keys = [k for k in keys if k]
-if not keys:
-    raise RuntimeError("No Gemini API keys found")
+<select id="lang">
+<option value="ar">عربي</option>
+<option value="en">English</option>
+</select>
 
-key_cycle = itertools.cycle(keys)
+<button onclick="manualQuiz()">إنشاء الاختبار</button>
+</div>
 
-MODEL_NAME = "models/gemini-2.5-flash-lite"
-MAX_PER_BATCH = 10
-MAX_TOTAL = 60
+<!-- اختبار من ملف -->
+<div id="file" class="hidden">
+<input type="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg">
 
-def call_gemini(prompt: str) -> str:
-    last_error = None
-    for _ in range(len(keys)):
-        try:
-            api_key = next(key_cycle)
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(MODEL_NAME)
-            response = model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            last_error = str(e)
-            continue
-    raise RuntimeError(f"All keys failed: {last_error}")
+<select id="fileCount">
+<option value="5">5</option>
+<option value="10" selected>10</option>
+<option value="20">20</option>
+<option value="30">30</option>
+<option value="40">40</option>
+<option value="50">50</option>
+<option value="60">60</option>
+</select>
 
-def extract_json(text: str) -> dict:
-    try:
-        return json.loads(text)
-    except:
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            raise ValueError("JSON not found in model response")
-        return json.loads(match.group())
+<select id="fileLang">
+<option value="ar">عربي</option>
+<option value="en">English</option>
+</select>
 
-def generate_questions(base_prompt: str, total: int) -> dict:
-    total = min(total, MAX_TOTAL)
-    batches = math.ceil(total / MAX_PER_BATCH)
-    all_questions = []
+<button onclick="fileQuiz()">إنشاء الأسئلة</button>
+</div>
 
-    for _ in range(batches):
-        count = min(MAX_PER_BATCH, total - len(all_questions))
-        prompt = base_prompt.replace("{N}", str(count))
-        text = call_gemini(prompt)
-        data = extract_json(text)
+<!-- تلخيص -->
+<div id="summary" class="hidden">
+<input type="file" id="sumFile" accept=".pdf,.png,.jpg,.jpeg">
+<select id="sumLang">
+<option value="ar">عربي</option>
+<option value="en">English</option>
+</select>
+<button onclick="summarize()">تلخيص الملف</button>
+</div>
 
-        if "questions" not in data or not isinstance(data["questions"], list):
-            raise ValueError("Invalid questions format from model")
+<div id="result"></div>
+<button id="nextBtn" class="hidden" onclick="nextQuestion()">التالي</button>
 
-        all_questions.extend(data["questions"])
+</div>
 
-    return {"questions": all_questions[:total]}
+<script>
+const BACKEND="https://smarttest-0ycc.onrender.com"
+let questions=[]
+let answers=[]
+let index=0
 
-@app.get("/")
-def root():
-    return {"status": "ok"}
+function showTab(t){
+["manual","file","summary"].forEach(x=>document.getElementById(x).classList.add("hidden"))
+document.getElementById(t).classList.remove("hidden")
+result.innerHTML=""
+nextBtn.classList.add("hidden")
+}
 
-@app.post("/ask")
-def manual_quiz(req: AskRequest):
-    base_prompt = f"""
-أنشئ {{N}} سؤال اختبار حول الموضوع التالي:
+function safeParse(t){
+return JSON.parse(t.replace(/```json|```/g,"").trim())
+}
 
-{req.prompt}
+async function manualQuiz(){
+const count = manualCount.value
 
-اللغة المطلوبة: {req.language}
-
-قواعد صارمة:
-- أسئلة اختيار من متعدد
-- 4 خيارات لكل سؤال
-- لكل خيار تغذية راجعة توضح لماذا هو صحيح أو خاطئ
-- شرح موسع وتعليمي للإجابة الصحيحة فقط
-- لا تكتب أي نص خارج JSON
-
-الصيغة المطلوبة (JSON فقط):
-
-{{
-  "questions": [
-    {{
-      "question": "...",
-      "options": [
-        {{"text": "...", "feedback": "..."}},
-        {{"text": "...", "feedback": "..."}},
-        {{"text": "...", "feedback": "..."}},
-        {{"text": "...", "feedback": "..."}}
-      ],
-      "correct": 0,
-      "correct_feedback": "شرح موسع وعميق للإجابة الصحيحة"
-    }}
-  ]
-}}
-"""
-    try:
-        return generate_questions(base_prompt, req.total_questions)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/quiz-from-file")
-def quiz_from_file(req: FileQuizRequest):
-    base_prompt = f"""
-اعتماداً على المحتوى التالي:
-
-{req.content}
-
-أنشئ {{N}} سؤال اختبار.
-
-اللغة المطلوبة: {req.language}
+const prompt = `
+أنشئ اختبار مكوّن من ${count} سؤال اختيار من متعدد حول الموضوع التالي:
+${topic.value}
 
 قواعد صارمة:
-- أسئلة اختيار من متعدد
 - 4 خيارات لكل سؤال
-- لكل خيار تغذية راجعة
 - شرح موسع للإجابة الصحيحة
-- لا تكتب أي نص خارج JSON
-
-الصيغة المطلوبة (JSON فقط):
-
-{{
-  "questions": [
-    {{
-      "question": "...",
-      "options": [
-        {{"text": "...", "feedback": "..."}},
-        {{"text": "...", "feedback": "..."}},
-        {{"text": "...", "feedback": "..."}},
-        {{"text": "...", "feedback": "..."}}
-      ],
-      "correct": 0,
-      "correct_feedback": "شرح موسع للإجابة الصحيحة"
-    }}
-  ]
-}}
-"""
-    try:
-        return generate_questions(base_prompt, req.total_questions)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/summarize")
-def summarize(req: SummaryRequest):
-    prompt = f"""
-لخص المحتوى التالي بأسلوب احترافي وتعليمي.
-
-اللغة المطلوبة: {req.language}
-
-قواعد:
+- شرح مختصر لكل خيار خاطئ
 - لا تكرر الأفكار
-- استخدم عناوين فرعية واضحة
-- ركز على الفهم العميق
-- مناسب للطلاب
+- لا تخرج عن الموضوع
+- أعد النتيجة JSON فقط
 
-المحتوى:
-{req.content}
-"""
-    try:
-        summary = call_gemini(prompt)
-        return {"summary": summary}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+الصيغة:
+{
+ "questions":[
+  {
+   "q":"",
+   "options":["","","",""],
+   "answer":0,
+   "explanations":["","","",""]
+  }
+ ]
+}
+`
+
+const r = await fetch(BACKEND+"/ask",{
+method:"POST",
+headers:{"Content-Type":"application/json"},
+body:JSON.stringify({prompt,language:lang.value})
+})
+
+const d = await r.json()
+questions = safeParse(d.result).questions
+answers = new Array(questions.length).fill(null)
+index = 0
+nextBtn.classList.remove("hidden")
+renderQuestion()
+}
+
+async function fileQuiz(){
+const fd=new FormData()
+fd.append("file",fileInput.files[0])
+fd.append("mode","questions")
+fd.append("language",fileLang.value)
+fd.append("num_questions", fileCount.value)
+
+const r = await fetch(BACKEND+"/ask-file",{method:"POST",body:fd})
+const d = await r.json()
+questions = safeParse(d.result).questions
+answers = new Array(questions.length).fill(null)
+index = 0
+nextBtn.classList.remove("hidden")
+renderQuestion()
+}
+
+async function summarize(){
+const fd=new FormData()
+fd.append("file",sumFile.files[0])
+fd.append("mode","summary")
+fd.append("language",sumLang.value)
+
+const r = await fetch(BACKEND+"/ask-file",{method:"POST",body:fd})
+const d = await r.json()
+
+result.innerHTML = `<div class="box">${d.result}</div>`
+}
+
+function renderQuestion(){
+const q=questions[index]
+let html=`<h3>${q.q}</h3>`
+
+q.options.forEach((o,i)=>{
+let cls="option"
+if(answers[index]!==null){
+if(i===q.answer) cls+=" correct"
+else cls+=" incorrect"
+}
+
+html+=`
+<div class="${cls}" onclick="choose(${i})">
+${o}
+${answers[index]!==null ? `<div class="feedback">${q.explanations[i]}</div>` : ""}
+</div>`
+})
+
+result.innerHTML = html
+}
+
+function choose(i){
+if(answers[index]!==null) return
+answers[index]=i
+renderQuestion()
+}
+
+function nextQuestion(){
+if(index < questions.length-1){
+index++
+renderQuestion()
+}else{
+let correct=0
+answers.forEach((a,i)=>{if(a===questions[i].answer) correct++})
+result.innerHTML = `<h2>النتيجة: ${correct} / ${questions.length}</h2>`
+nextBtn.classList.add("hidden")
+}
+}
+</script>
+
+</body>
+</html>
