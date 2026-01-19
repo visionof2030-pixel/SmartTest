@@ -2,10 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
-import os
-import itertools
-import io
-import json
+import os, itertools, io, json
 import pdfplumber
 from PIL import Image
 
@@ -20,18 +17,9 @@ app.add_middleware(
 )
 
 MODEL = "gemini-2.5-flash-lite"
-MAX_QUESTIONS_PER_CALL = 10
 MAX_TOTAL_QUESTIONS = 60
 
-keys = [
-    os.getenv("GEMINI_KEY_1"),
-    os.getenv("GEMINI_KEY_2"),
-    os.getenv("GEMINI_KEY_3"),
-    os.getenv("GEMINI_KEY_4"),
-    os.getenv("GEMINI_KEY_5"),
-    os.getenv("GEMINI_KEY_6"),
-    os.getenv("GEMINI_KEY_7"),
-]
+keys = [os.getenv(f"GEMINI_KEY_{i}") for i in range(1, 8)]
 keys = [k for k in keys if k]
 if not keys:
     raise RuntimeError("No Gemini API keys found")
@@ -42,16 +30,19 @@ def get_model():
     genai.configure(api_key=next(key_cycle))
     return genai.GenerativeModel(MODEL)
 
-def lang_instruction(lang: str):
-    return "Write the final output in clear academic English." if lang == "en" else "اكتب الناتج النهائي باللغة العربية الفصحى."
+def lang_instruction(lang):
+    return (
+        "Write the output in clear academic English."
+        if lang == "en"
+        else "اكتب الناتج باللغة العربية الفصحى."
+    )
 
-def extract_text_from_pdf(data: bytes):
+def extract_pdf(data: bytes):
     text = ""
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                text += t + "\n"
+            if page.extract_text():
+                text += page.extract_text() + "\n"
     return text.strip()
 
 def prepare_image(data: bytes):
@@ -60,7 +51,7 @@ def prepare_image(data: bytes):
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-class AskRequest(BaseModel):
+class ManualQuiz(BaseModel):
     prompt: str
     language: str = "ar"
     total_questions: int = 10
@@ -69,24 +60,25 @@ class AskRequest(BaseModel):
 def root():
     return {"status": "ok"}
 
+# ========== اختبار يدوي ==========
 @app.post("/ask")
-def ask(req: AskRequest):
+def manual_quiz(req: ManualQuiz):
     if req.total_questions > MAX_TOTAL_QUESTIONS:
-        raise HTTPException(status_code=400, detail="Maximum allowed questions is 60")
+        raise HTTPException(400, "Max 60 questions")
 
     model = get_model()
+
     prompt = f"""
 {lang_instruction(req.language)}
 
-أنشئ اختبار اختيار من متعدد من الموضوع التالي.
+أنشئ EXACTLY {req.total_questions} سؤال اختيار من متعدد.
 
-قواعد صارمة:
-- أنشئ EXACTLY {req.total_questions} سؤالًا
-- 4 خيارات لكل سؤال
+قواعد:
+- 4 خيارات
 - شرح موسع للإجابة الصحيحة
 - شرح مختصر لكل خيار خاطئ
-- لا تكرر الأفكار
-- أعد JSON فقط
+- لا تكرار
+- JSON فقط
 
 الصيغة:
 {{
@@ -103,9 +95,11 @@ def ask(req: AskRequest):
 الموضوع:
 {req.prompt}
 """
-    r = model.generate_content(prompt)
-    return json.loads(r.text)
 
+    r = model.generate_content(prompt)
+    return {"result": r.text}
+
+# ========== ملف / صورة ==========
 @app.post("/ask-file")
 async def ask_file(
     file: UploadFile = File(...),
@@ -114,72 +108,52 @@ async def ask_file(
     num_questions: int = Form(10)
 ):
     if num_questions > MAX_TOTAL_QUESTIONS:
-        raise HTTPException(status_code=400, detail="Maximum allowed questions is 60")
+        raise HTTPException(400, "Max 60 questions")
 
     data = await file.read()
     model = get_model()
 
-    text = None
-    image = None
-
+    text, image = None, None
     name = file.filename.lower()
+
     if name.endswith(".pdf"):
-        text = extract_text_from_pdf(data)
+        text = extract_pdf(data)
         if not text:
-            raise HTTPException(status_code=400, detail="PDF has no readable text")
+            raise HTTPException(400, "Empty PDF")
     elif name.endswith((".png", ".jpg", ".jpeg")):
         image = prepare_image(data)
     else:
-        raise HTTPException(status_code=400, detail="Unsupported file type")
+        raise HTTPException(400, "Unsupported file")
 
+    # ===== تلخيص =====
     if mode == "summary":
         prompt = f"""
 {lang_instruction(language)}
 
-لخص المحتوى التالي بدون تكرار:
-- دمج الأفكار المتشابهة
-- تنظيم المحتوى
-- صياغة تعليمية واضحة
-- لا تطِل بدون فائدة
-
-الناتج:
-1. ملخص عام
-2. الأفكار الرئيسية
-3. النقاط المهمة
-4. خلاصة نهائية
+لخص المحتوى التالي باحتراف:
+- بدون تكرار
+- أفكار مرتبة
+- مناسب للملفات الكبيرة
 """
-        if text:
-            r = model.generate_content(prompt + "\n" + text[:12000])
-        else:
-            r = model.generate_content([
-                prompt,
-                {"mime_type": file.content_type, "data": image}
-            ])
-        return {"summary": r.text}
+        r = (
+            model.generate_content(prompt + text[:12000])
+            if text
+            else model.generate_content([prompt, {"mime_type": file.content_type, "data": image}])
+        )
+        return {"result": r.text}
 
-    all_questions = []
-    remaining = num_questions
-    batch_index = 1
-
-    while remaining > 0:
-        batch_size = min(MAX_QUESTIONS_PER_CALL, remaining)
-
-        batch_prompt = f"""
+    # ===== أسئلة =====
+    prompt = f"""
 {lang_instruction(language)}
 
-مهم جدًا:
-- أنشئ EXACTLY {batch_size} سؤالًا فقط
-- هذه الدفعة رقم {batch_index}
-- لا تُكرر أي سؤال سابق
+أنشئ EXACTLY {num_questions} سؤال اختيار من متعدد من المحتوى التالي.
 
-أنشئ {batch_size} سؤال اختيار من متعدد من المحتوى التالي.
-
-قواعد صارمة:
-- 4 خيارات لكل سؤال
+قواعد:
+- 4 خيارات
 - شرح موسع للإجابة الصحيحة
 - شرح مختصر لكل خيار خاطئ
-- لا تكرر الأفكار
-- أعد JSON فقط
+- لا تكرار
+- JSON فقط
 
 الصيغة:
 {{
@@ -194,27 +168,10 @@ async def ask_file(
 }}
 """
 
-        if text:
-            r = model.generate_content(batch_prompt + "\n" + text[:12000])
-        else:
-            r = model.generate_content([
-                batch_prompt,
-                {"mime_type": file.content_type, "data": image}
-            ])
+    r = (
+        model.generate_content(prompt + text[:12000])
+        if text
+        else model.generate_content([prompt, {"mime_type": file.content_type, "data": image}])
+    )
 
-        try:
-            parsed = json.loads(r.text)
-            all_questions.extend(parsed["questions"])
-        except Exception:
-            break
-
-        remaining -= batch_size
-        batch_index += 1
-
-    if len(all_questions) < num_questions:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Generated only {len(all_questions)} questions out of {num_questions}"
-        )
-
-    return {"questions": all_questions[:num_questions]}
+    return {"result": r.text}
