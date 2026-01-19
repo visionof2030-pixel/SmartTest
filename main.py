@@ -5,6 +5,7 @@ import google.generativeai as genai
 import os
 import itertools
 import io
+import json
 import pdfplumber
 from PIL import Image
 
@@ -19,6 +20,8 @@ app.add_middleware(
 )
 
 MODEL = "gemini-2.5-flash-lite"
+MAX_QUESTIONS_PER_CALL = 10
+MAX_TOTAL_QUESTIONS = 60
 
 keys = [
     os.getenv("GEMINI_KEY_1"),
@@ -60,6 +63,7 @@ def prepare_image(data: bytes):
 class AskRequest(BaseModel):
     prompt: str
     language: str = "ar"
+    total_questions: int = 10
 
 @app.get("/")
 def root():
@@ -67,6 +71,9 @@ def root():
 
 @app.post("/ask")
 def ask(req: AskRequest):
+    if req.total_questions > MAX_TOTAL_QUESTIONS:
+        raise HTTPException(status_code=400, detail="Maximum allowed questions is 60")
+
     model = get_model()
     prompt = f"""
 {lang_instruction(req.language)}
@@ -74,7 +81,7 @@ def ask(req: AskRequest):
 أنشئ اختبار اختيار من متعدد من الموضوع التالي.
 
 قواعد صارمة:
-- عدد مناسب من الأسئلة حسب عمق الموضوع
+- أنشئ EXACTLY {req.total_questions} سؤالًا
 - 4 خيارات لكل سؤال
 - شرح موسع للإجابة الصحيحة
 - شرح مختصر لكل خيار خاطئ
@@ -97,7 +104,7 @@ def ask(req: AskRequest):
 {req.prompt}
 """
     r = model.generate_content(prompt)
-    return {"result": r.text}
+    return json.loads(r.text)
 
 @app.post("/ask-file")
 async def ask_file(
@@ -106,6 +113,9 @@ async def ask_file(
     language: str = Form("ar"),
     num_questions: int = Form(10)
 ):
+    if num_questions > MAX_TOTAL_QUESTIONS:
+        raise HTTPException(status_code=400, detail="Maximum allowed questions is 60")
+
     data = await file.read()
     model = get_model()
 
@@ -145,19 +155,30 @@ async def ask_file(
                 prompt,
                 {"mime_type": file.content_type, "data": image}
             ])
-        return {"result": r.text}
+        return {"summary": r.text}
 
-    prompt = f"""
+    all_questions = []
+    remaining = num_questions
+    batch_index = 1
+
+    while remaining > 0:
+        batch_size = min(MAX_QUESTIONS_PER_CALL, remaining)
+
+        batch_prompt = f"""
 {lang_instruction(language)}
 
-أنشئ {num_questions} سؤال اختيار من متعدد من المحتوى التالي.
+مهم جدًا:
+- أنشئ EXACTLY {batch_size} سؤالًا فقط
+- هذه الدفعة رقم {batch_index}
+- لا تُكرر أي سؤال سابق
+
+أنشئ {batch_size} سؤال اختيار من متعدد من المحتوى التالي.
 
 قواعد صارمة:
 - 4 خيارات لكل سؤال
 - شرح موسع للإجابة الصحيحة
 - شرح مختصر لكل خيار خاطئ
-- غطِّ جميع الأفكار المهمة
-- لا تكرر الأسئلة
+- لا تكرر الأفكار
 - أعد JSON فقط
 
 الصيغة:
@@ -173,12 +194,27 @@ async def ask_file(
 }}
 """
 
-    if text:
-        r = model.generate_content(prompt + "\n" + text[:12000])
-    else:
-        r = model.generate_content([
-            prompt,
-            {"mime_type": file.content_type, "data": image}
-        ])
+        if text:
+            r = model.generate_content(batch_prompt + "\n" + text[:12000])
+        else:
+            r = model.generate_content([
+                batch_prompt,
+                {"mime_type": file.content_type, "data": image}
+            ])
 
-    return {"result": r.text}
+        try:
+            parsed = json.loads(r.text)
+            all_questions.extend(parsed["questions"])
+        except Exception:
+            break
+
+        remaining -= batch_size
+        batch_index += 1
+
+    if len(all_questions) < num_questions:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Generated only {len(all_questions)} questions out of {num_questions}"
+        )
+
+    return {"questions": all_questions[:num_questions]}
