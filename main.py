@@ -1,11 +1,14 @@
-# main.py
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
-import os, itertools, io, base64
+import os
+import itertools
+import io
 import pdfplumber
 from PIL import Image
+import math
+import json
 
 app = FastAPI()
 
@@ -17,7 +20,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================== API KEYS ==================
+MODEL = "gemini-2.5-flash-lite"
+
 keys = [
     os.getenv("GEMINI_KEY_1"),
     os.getenv("GEMINI_KEY_2"),
@@ -32,36 +36,41 @@ if not keys:
     raise RuntimeError("No Gemini API keys found")
 
 key_cycle = itertools.cycle(keys)
-MODEL = "gemini-2.5-flash-lite"
 
 def get_model():
     genai.configure(api_key=next(key_cycle))
     return genai.GenerativeModel(MODEL)
 
 def lang_instruction(lang):
-    return "Write output in clear academic English." if lang == "en" else "اكتب الناتج باللغة العربية الفصحى."
+    return "Write the final output in clear academic English." if lang == "en" else "اكتب الناتج النهائي باللغة العربية الفصحى."
 
-# ================== UTILS ==================
-def pdf_text(b: bytes):
+def extract_text_from_pdf(data: bytes):
     text = ""
-    with pdfplumber.open(io.BytesIO(b)) as pdf:
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
         for p in pdf.pages:
-            if p.extract_text():
-                text += p.extract_text() + "\n"
+            t = p.extract_text()
+            if t:
+                text += t + "\n"
     return text.strip()
 
-def image_bytes(b: bytes):
-    img = Image.open(io.BytesIO(b))
+def prepare_image(data: bytes):
+    img = Image.open(io.BytesIO(data))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-# ================== MODELS ==================
+def chunk_text(text, max_chars=4000):
+    return [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
+
+def safe_json(text):
+    text = text.replace("```json", "").replace("```", "").strip()
+    return json.loads(text)
+
 class AskRequest(BaseModel):
     prompt: str
     language: str = "ar"
+    num_questions: int = 10
 
-# ================== ENDPOINTS ==================
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -72,12 +81,12 @@ def ask(req: AskRequest):
     prompt = f"""
 {lang_instruction(req.language)}
 
-أنشئ اختبار اختيار من متعدد من الموضوع التالي.
+أنشئ {req.num_questions} سؤال اختيار من متعدد عن الموضوع التالي.
 
 قواعد:
 - 4 خيارات
-- شرح موسع للإجابة الصحيحة
-- شرح مختصر للخاطئة
+- شرح موسع للصحيح
+- شرح مختصر للخاطئ
 - أعد JSON فقط
 
 الصيغة:
@@ -102,20 +111,24 @@ def ask(req: AskRequest):
 async def ask_file(
     file: UploadFile = File(...),
     mode: str = Form("questions"),
-    language: str = Form("ar")
+    language: str = Form("ar"),
+    num_questions: int = Form(10)
 ):
-    b = await file.read()
+    data = await file.read()
     model = get_model()
 
-    if file.filename.lower().endswith(".pdf"):
-        text = pdf_text(b)
+    text = None
+    image = None
+
+    name = file.filename.lower()
+    if name.endswith(".pdf"):
+        text = extract_text_from_pdf(data)
         if not text:
-            raise HTTPException(400, "PDF has no text")
-        content = text
-        img = None
+            raise HTTPException(400, "PDF has no readable text")
+    elif name.endswith((".png", ".jpg", ".jpeg")):
+        image = prepare_image(data)
     else:
-        img = image_bytes(b)
-        content = None
+        raise HTTPException(400, "Unsupported file type")
 
     if mode == "summary":
         prompt = f"""
@@ -123,7 +136,7 @@ async def ask_file(
 
 لخص المحتوى التالي بدون تكرار:
 - دمج الأفكار
-- تنظيم
+- تنظيم المحتوى
 - أسلوب تعليمي
 
 الناتج:
@@ -132,20 +145,30 @@ async def ask_file(
 3. نقاط مهمة
 4. خلاصة
 """
-        if content:
-            r = model.generate_content(prompt + "\n" + content[:12000])
+        if text:
+            r = model.generate_content(prompt + "\n" + text[:12000])
         else:
-            r = model.generate_content([prompt, {"mime_type": file.content_type, "data": img}])
+            r = model.generate_content([prompt, {"mime_type": file.content_type, "data": image}])
         return {"result": r.text}
 
-    prompt = f"""
+    all_questions = []
+    chunks = chunk_text(text, 4000) if text else [None]
+    per_chunk = max(1, math.ceil(num_questions / len(chunks)))
+
+    for chunk in chunks:
+        if len(all_questions) >= num_questions:
+            break
+
+        prompt = f"""
 {lang_instruction(language)}
 
-أنشئ أسئلة تعليمية اختيار من متعدد:
+أنشئ {per_chunk} سؤال اختيار من متعدد من المحتوى التالي.
+
+قواعد صارمة:
 - 4 خيارات
 - شرح موسع للصحيح
 - شرح مختصر للخاطئ
-- لا تكرر الأفكار
+- لا تكرر الأسئلة
 - أعد JSON فقط
 
 الصيغة:
@@ -160,8 +183,15 @@ async def ask_file(
  ]
 }}
 """
-    if content:
-        r = model.generate_content(prompt + "\n" + content[:12000])
-    else:
-        r = model.generate_content([prompt, {"mime_type": file.content_type, "data": img}])
-    return {"result": r.text}
+        if chunk:
+            r = model.generate_content(prompt + "\n" + chunk)
+        else:
+            r = model.generate_content([
+                prompt,
+                {"mime_type": file.content_type, "data": image}
+            ])
+
+        parsed = safe_json(r.text)
+        all_questions.extend(parsed.get("questions", []))
+
+    return {"result": json.dumps({"questions": all_questions[:num_questions]}, ensure_ascii=False)}
